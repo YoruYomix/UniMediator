@@ -430,7 +430,7 @@ public UniTask HandleAsync(AttackRequest request, CancellationToken ct)
 Add via **Window → Package Manager → + → Add package from git URL**:
 
 ```
-https://github.com/YoruYomix/RxFSM.git?path=com.yoruyomix.UniMediator
+https://github.com/YoruYomix/UniMediator.git?path=com.yoruyomix.UniMediator
 ```
 
 ---
@@ -454,7 +454,7 @@ It automatically scans your assembly and binds all handlers and filters into the
 Install via **Window → Package Manager → + → Add package from git URL**:
 
 ```
-https://github.com/YoruYomix/RxFSM.git?path=com.yoruyomix.UniMediator.VContainer
+https://github.com/YoruYomix/UniMediator.git?path=com.yoruyomix.UniMediator.VContainer
 ```
 
 ### Setup
