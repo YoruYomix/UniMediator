@@ -164,6 +164,155 @@ Not calling `next` stops the pipeline. Code after `await next(...)` runs on the 
 
 ---
 
+## Filter Reuse Examples
+
+The same filters can be mixed and matched across handlers via Cost Interfaces. Each handler declares only the filters it needs — the filters themselves are unaware of the concrete request type.
+
+### Filter–Handler matrix
+
+| Filter              | EnhanceHandler | AwakeningHandler | PurchaseHandler |
+|---------------------|:--------------:|:----------------:|:---------------:|
+| NetworkCheckFilter  | ✓              | ✓                | ✓               |
+| GoldCheckFilter     | ✓              | ✓                |                 |
+| GemCheckFilter      | ✓              |                  |                 |
+| ChaliceCheckFilter  |                | ✓                |                 |
+| DiamondCheckFilter  |                |                  | ✓               |
+| DeductGoldFilter    | ✓              | ✓                |                 |
+| DeductGemFilter     | ✓              |                  |                 |
+| DeductChaliceFilter |                | ✓                |                 |
+| DeductDiamondFilter |                |                  | ✓               |
+
+---
+
+### Example 1 — EnhanceHandler (Gold + Gem)
+
+```csharp
+public struct EnhanceRequest : IRequest<EnhanceResult>, IHasRequiredGold, IHasRequiredGem
+{
+    public int CharacterId  { get; }
+    public int RequiredGold { get; }
+    public int RequiredGem  { get; }
+
+    public EnhanceRequest(int characterId, int requiredGold = 10000, int requiredGem = 400)
+    {
+        CharacterId  = characterId;
+        RequiredGold = requiredGold;
+        RequiredGem  = requiredGem;
+    }
+}
+
+public struct EnhanceResult { public bool Success; }
+
+[Filter(typeof(NetworkCheckFilter), Order = 0)]
+[Filter(typeof(GoldCheckFilter),    Order = 1)]
+[Filter(typeof(GemCheckFilter),     Order = 2)]
+[Filter(typeof(DeductGoldFilter),   Order = 3)]
+[Filter(typeof(DeductGemFilter),    Order = 4)]
+public class EnhanceHandler : IRequestHandler<EnhanceRequest, EnhanceResult>
+{
+    public async ValueTask<EnhanceResult> HandleAsync(EnhanceRequest request, CancellationToken ct = default)
+    {
+        await GameData.Characters.UpgradeStarAsync(request.CharacterId, fromStar: 4, toStar: 5, ct);
+        return new EnhanceResult { Success = true };
+    }
+}
+```
+
+```
+NetworkCheck → GoldCheck → GemCheck → DeductGold → DeductGem → EnhanceHandler
+```
+
+---
+
+### Example 2 — AwakeningHandler (Gold + Chalice)
+
+```csharp
+public struct AwakeningRequest : IRequest<AwakeningResult>, IHasRequiredGold, IHasRequiredChalice
+{
+    public int CharacterId    { get; }
+    public int RequiredGold   { get; }
+    public int RequiredChalice { get; }
+
+    public AwakeningRequest(int characterId, int requiredGold = 30000, int requiredChalice = 1)
+    {
+        CharacterId     = characterId;
+        RequiredGold    = requiredGold;
+        RequiredChalice = requiredChalice;
+    }
+}
+
+public struct AwakeningResult { public bool Success; }
+
+[Filter(typeof(NetworkCheckFilter),  Order = 0)]
+[Filter(typeof(GoldCheckFilter),     Order = 1)]
+[Filter(typeof(ChaliceCheckFilter),  Order = 2)]
+[Filter(typeof(DeductGoldFilter),    Order = 3)]
+[Filter(typeof(DeductChaliceFilter), Order = 4)]
+public class AwakeningHandler : IRequestHandler<AwakeningRequest, AwakeningResult>
+{
+    public async ValueTask<AwakeningResult> HandleAsync(AwakeningRequest request, CancellationToken ct = default)
+    {
+        await GameData.Characters.AwakenAsync(request.CharacterId, ct);
+        return new AwakeningResult { Success = true };
+    }
+}
+```
+
+```
+NetworkCheck → GoldCheck → ChaliceCheck → DeductGold → DeductChalice → AwakeningHandler
+```
+
+---
+
+### Example 3 — PurchaseHandler (Diamond only)
+
+
+```csharp
+public struct PurchaseRequest : IRequest<PurchaseResult>, IHasRequiredDiamond
+{
+    public int ItemId           { get; }
+    public int RequiredDiamond  { get; }
+
+    public PurchaseRequest(int itemId, int requiredDiamond)
+    {
+        ItemId          = itemId;
+        RequiredDiamond = requiredDiamond;
+    }
+}
+
+public struct PurchaseResult { public bool Success; }
+
+[Filter(typeof(NetworkCheckFilter),   Order = 0)]
+[Filter(typeof(DiamondCheckFilter),   Order = 1)]
+[Filter(typeof(DeductDiamondFilter),  Order = 2)]
+public class PurchaseHandler : IRequestHandler<PurchaseRequest, PurchaseResult>
+{
+    public async ValueTask<PurchaseResult> HandleAsync(PurchaseRequest request, CancellationToken ct = default)
+    {
+        await GameData.Shop.PurchaseAsync(request.ItemId, ct);
+        return new PurchaseResult { Success = true };
+    }
+}
+```
+
+```
+NetworkCheck → DiamondCheck → DeductDiamond → PurchaseHandler
+```
+
+---
+
+### Registering multiple handlers
+
+```csharp
+_publisher = new Mediator()
+    .AddFilter(new ExceptionHandlingFilter())
+    .Register<EnhanceRequest,   EnhanceResult>  (new EnhanceHandler(),   EnhanceHandlerFilterRegistry.Filters)
+    .Register<AwakeningRequest, AwakeningResult>(new AwakeningHandler(), AwakeningHandlerFilterRegistry.Filters)
+    .Register<PurchaseRequest,  PurchaseResult> (new PurchaseHandler(),  PurchaseHandlerFilterRegistry.Filters)
+    .BuildPublisher();
+```
+
+
 ## Built-in Filters
 
 ### ExceptionHandlingFilter
