@@ -2,40 +2,52 @@
 
 A Unity-specific Mediator pattern library — MediatR's convenience + IL2CPP safety, no DI framework required.
 
----
-
-## What Can It Do?
-
-UniMediator lets you decouple game logic with a clean request/handler pipeline, with **filters** you can chain in order — perfect for validation, cost deduction, logging, auth, and more.
-
-No DI framework needed. Just `new` up your handlers and filters and register them directly.
 
 ---
 
-## Example: Character Enhancement (4★ → 5★)
+## Features
+
+- **Middleware pipeline** — attach filter chains to each handler via `[Filter]` attributes
+- **Filter reuse** — Cost Interfaces (`IHasRequiredGold`, etc.) let filters work across request types without coupling
+- **Automatic rollback** — Deduct filters restore currency on downstream failure
+- **Cancellation tracking** — `RequestContext` exposes which filter cancelled the request and why
+- **Source Generator** — `[Filter]` attributes are read at build time to generate `FilterRegistry` classes; zero runtime reflection
+- **UniTask support** — automatically uses `UniTask` when `com.cysharp.unitask` is present, falls back to `ValueTask`
+- **VContainer extension** — auto-scans assemblies to register all handlers and filters; no manual wiring (separate package)
+
+---
+
+## Installation
+
+**Window → Package Manager → + → Add package from git URL**
 
 ```
-SendAsync(EnhanceRequest)
-  → NetworkCheckFilter     (no network → show popup & block)
-    → GemCheckFilter       (gem < 400 → show popup & block)
-      → GoldCheckFilter    (gold < 10,000 → show popup & block)
-        → DeductCostFilter (deduct gems & gold)
-          → EnhanceHandler (upgrade 4★→5★, show success popup, return true)
+https://github.com/YoruYomix/UniMediator.git?path=com.yoruyomix.UniMediator
 ```
 
-### Request / Result
+### VContainer Extension (optional)
+
+```
+https://github.com/YoruYomix/UniMediator.git?path=com.yoruyomix.UniMediator.VContainer
+```
+
+---
+
+## Quick Start
+
+### 1. Define a Request and Result
 
 ```csharp
-public struct EnhanceRequest : IRequest<EnhanceResult>
+public struct EnhanceRequest : IRequest<EnhanceResult>, IHasRequiredGold, IHasRequiredGem
 {
-    public int CharacterId;
-    public int RequiredGem;
-    public int RequiredGold;
+    public int CharacterId  { get; }
+    public int RequiredGold { get; }
+    public int RequiredGem  { get; }
 
     public EnhanceRequest(int characterId, int requiredGem = 400, int requiredGold = 10000)
     {
-        CharacterId = characterId;
-        RequiredGem = requiredGem;
+        CharacterId  = characterId;
+        RequiredGem  = requiredGem;
         RequiredGold = requiredGold;
     }
 }
@@ -46,461 +58,324 @@ public struct EnhanceResult
 }
 ```
 
-### Filter 1 — Network Check
+### 2. Write a Handler and Declare Filters
 
 ```csharp
-public class NetworkCheckFilter : IFilter<EnhanceRequest>
+[Filter(typeof(NetworkCheckFilter), Order = 0)]
+[Filter(typeof(GoldCheckFilter),    Order = 1)]
+[Filter(typeof(GemCheckFilter),     Order = 2)]
+[Filter(typeof(DeductGoldFilter),   Order = 3)]
+[Filter(typeof(DeductGemFilter),    Order = 4)]
+public class EnhanceHandler : IRequestHandler<EnhanceRequest, EnhanceResult>
 {
-    public async UniTask InvokeAsync(EnhanceRequest request, CancellationToken ct, Func<UniTask> next)
+    public async ValueTask<EnhanceResult> HandleAsync(EnhanceRequest request, CancellationToken ct = default)
     {
-        if (Application.internetReachability == NetworkReachability.NotReachable)
-        {
-            // Replace with your own popup call
-            Debug.LogWarning("Network is not connected.");
-            return; // pipeline blocked — next() is never called
-        }
-        await next();
+        await GameData.Characters.UpgradeStarAsync(request.CharacterId, fromStar: 4, toStar: 5, ct);
+        return new EnhanceResult { Success = true };
     }
 }
 ```
 
-### Filter 2 — Gem Check
+### 3. Build the Mediator and Send
 
 ```csharp
-public class GemCheckFilter : IFilter<EnhanceRequest>
+private IRequestPublisher _publisher;
+
+private void Awake()
 {
-    public async UniTask InvokeAsync(EnhanceRequest request, CancellationToken ct, Func<UniTask> next)
-    {
-        int currentGem = GameData.Inventory.Gem; // replace with your data source
-        if (currentGem < request.RequiredGem)
-        {
-            Debug.LogWarning($"Not enough gems. (Have: {currentGem} / Need: {request.RequiredGem})");
-            return;
-        }
-        await next();
-    }
+    _publisher = new Mediator()
+        .AddFilter(new ExceptionHandlingFilter())   // global filter
+        .Register<EnhanceRequest, EnhanceResult>(new EnhanceHandler(), EnhanceHandlerFilterRegistry.Filters)
+        .BuildPublisher();
+}
+
+public async void OnClickEnhance()
+{
+    var cts     = new CancellationTokenSource();
+    var context = new RequestContext();
+
+    EnhanceResult? result = await _publisher.SendAsync<EnhanceRequest, EnhanceResult>(
+        new EnhanceRequest(characterId: 1001),
+        context,
+        cts.Token);
+
+    if (result is { Success: true })
+        Debug.Log("Enhancement complete!");
+    else if (context.CancelledBy is not null)
+        Debug.Log($"[{context.CancelledBy.Name}] {context.CancellationReason}");
 }
 ```
 
-### Filter 3 — Gold Check
+---
+
+## Pipeline Overview
+
+Each request flows through its registered filters in order before reaching the handler.
+
+```
+Enhance Pipeline
+NetworkCheck(retry×3) → GoldCheck → GemCheck → DeductGold → DeductGem → EnhanceHandler
+                             ↓           ↓            ↓            ↓
+                     InsufficientGold  InsufficientGem  Rollback  Rollback
+
+Awakening Pipeline
+NetworkCheck(retry×3) → GoldCheck → ChaliceCheck → DeductGold → DeductChalice → AwakeningHandler
+                             ↓             ↓              ↓              ↓
+                     InsufficientGold  InsufficientChalice  Rollback  Rollback
+```
+
+---
+
+## Core Concepts
+
+### Cost Interfaces
+
+Separating cost information into interfaces lets filters operate across different request types without knowing the concrete type.
 
 ```csharp
-public class GoldCheckFilter : IFilter<EnhanceRequest>
+public interface IHasRequiredGold    { int RequiredGold    { get; } }
+public interface IHasRequiredGem     { int RequiredGem     { get; } }
+public interface IHasRequiredChalice { int RequiredChalice { get; } }
+```
+
+### RequestContext
+
+When a filter cancels the pipeline it writes its type and reason into `RequestContext`. The caller can inspect this for logging or UI feedback.
+
+```csharp
+public class RequestContext
 {
-    public async UniTask InvokeAsync(EnhanceRequest request, CancellationToken ct, Func<UniTask> next)
-    {
-        int currentGold = GameData.Inventory.Gold;
-        if (currentGold < request.RequiredGold)
-        {
-            Debug.LogWarning($"Not enough gold. (Have: {currentGold} / Need: {request.RequiredGold})");
-            return;
-        }
-        await next();
-    }
+    public Type?   CancelledBy        { get; internal set; }
+    public string? CancellationReason { get; internal set; }
 }
 ```
 
-### Filter 4 — Deduct Cost
+### IFilter
 
 ```csharp
-public class DeductCostFilter : IFilter<EnhanceRequest>
+public interface IFilter
 {
-    public async UniTask InvokeAsync(EnhanceRequest request, CancellationToken ct, Func<UniTask> next)
-    {
-        GameData.Inventory.Gem  -= request.RequiredGem;
-        GameData.Inventory.Gold -= request.RequiredGold;
+    ValueTask InvokeAsync<T>(T request, RequestContext context,
+        RequestContinuation<T> next) where T : IRequest;
+}
+```
 
+Not calling `next` stops the pipeline. Code after `await next(...)` runs on the way back out, making rollback straightforward.
+
+---
+
+## Built-in Filters
+
+### ExceptionHandlingFilter
+
+Catches unhandled exceptions, logs them, and loads the title scene. Re-throws `OperationCanceledException` (Dispose cancellation) without handling. Register as a global filter.
+
+```csharp
+public class ExceptionHandlingFilter : IFilter
+{
+    public async ValueTask InvokeAsync<T>(T request, RequestContext context,
+        RequestContinuation<T> next) where T : IRequest
+    {
         try
         {
-            await next();
+            await next(request, context);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception e)
+        {
+            Debug.LogException(e);
+            SceneManager.LoadScene("TitleMenu");
+        }
+    }
+}
+```
+
+### NetworkCheckFilter
+
+Checks internet reachability. Retries up to 3 times (1 s apart) before showing a popup and cancelling.
+
+```csharp
+public class NetworkCheckFilter : IFilter
+{
+    public async ValueTask InvokeAsync<T>(T request, RequestContext context,
+        RequestContinuation<T> next) where T : IRequest
+    {
+        const int maxRetry = 3;
+        for (int i = 0; i < maxRetry; i++)
+        {
+            if (Application.internetReachability != NetworkReachability.NotReachable)
+                break;
+
+            if (i == maxRetry - 1)
+            {
+                UIManager.ShowPopup("Network is unstable.");
+                context.CancelledBy        = typeof(NetworkCheckFilter);
+                context.CancellationReason = "Network unreachable";
+                return;
+            }
+
+            await Task.Delay(1000);
+        }
+
+        await next(request, context);
+    }
+}
+```
+
+### GoldCheckFilter / GemCheckFilter / ChaliceCheckFilter
+
+Show a popup and cancel when the player's balance is below the required amount. Work on any request that implements the corresponding Cost Interface.
+
+```csharp
+public class GoldCheckFilter : IFilter
+{
+    public async ValueTask InvokeAsync<T>(T request, RequestContext context,
+        RequestContinuation<T> next) where T : IRequest
+    {
+        if (request is IHasRequiredGold r && GameData.Inventory.Gold < r.RequiredGold)
+        {
+            UIManager.ShowPopup("Not enough Gold.");
+            context.CancelledBy        = typeof(GoldCheckFilter);
+            context.CancellationReason = $"Insufficient Gold (have: {GameData.Inventory.Gold} / need: {r.RequiredGold})";
+            return;
+        }
+
+        await next(request, context);
+    }
+}
+```
+
+### DeductGoldFilter / DeductGemFilter / DeductChaliceFilter
+
+Deduct the required amount before continuing. Automatically roll back on any downstream exception.
+
+```csharp
+public class DeductGoldFilter : IFilter
+{
+    public async ValueTask InvokeAsync<T>(T request, RequestContext context,
+        RequestContinuation<T> next) where T : IRequest
+    {
+        if (request is not IHasRequiredGold r)
+        {
+            await next(request, context);
+            return;
+        }
+
+        GameData.Inventory.Gold -= r.RequiredGold;
+        try
+        {
+            await next(request, context);
         }
         catch
         {
-            // Rollback on handler failure
-            GameData.Inventory.Gem  += request.RequiredGem;
-            GameData.Inventory.Gold += request.RequiredGold;
+            GameData.Inventory.Gold += r.RequiredGold;
             throw;
         }
     }
 }
 ```
 
-### Handler
-
-```csharp
-[Filter(typeof(NetworkCheckFilter), Order = 0)]
-[Filter(typeof(GemCheckFilter),     Order = 1)]
-[Filter(typeof(GoldCheckFilter),    Order = 2)]
-[Filter(typeof(DeductCostFilter),   Order = 3)]
-public class EnhanceHandler : IRequestHandler<EnhanceRequest, EnhanceResult>
-{
-    public async UniTask<EnhanceResult> HandleAsync(EnhanceRequest request, CancellationToken ct = default)
-    {
-        // Replace with your actual upgrade logic
-        await GameData.Characters.UpgradeStarAsync(request.CharacterId, fromStar: 4, toStar: 5, ct);
-
-        Debug.Log("Enhancement Success! ✨ Upgraded to 5★!");
-        return new EnhanceResult { Success = true };
-    }
-}
-```
-
-### Setup & Caller
-
-No DI container needed — just wire everything up with `new`.
-
-```csharp
-public class EnhanceButton : MonoBehaviour
-{
-    private Mediator _mediator;
-
-    private void Awake()
-    {
-        _mediator = new Mediator();
-
-        // Per-handler filters are declared via [Filter] on the handler class itself.
-        // Just register the handler — filters are picked up automatically.
-        _mediator.Register<EnhanceRequest, EnhanceResult>(new EnhanceHandler());
-
-        // Optional: global filters apply to every request
-        // _mediator.AddFilter(new LoggingFilter());
-    }
-
-    public async void OnClickEnhance()
-    {
-        var result = await _mediator.SendAsync<EnhanceRequest, EnhanceResult>(
-            new EnhanceRequest(characterId: 1001));
-
-        // If any filter blocked the pipeline, Success stays false (default)
-        if (result.Success)
-            Debug.Log("Enhancement complete!");
-        else
-            Debug.Log("Enhancement was cancelled.");
-    }
-}
-```
-
-| Step | Filter / Handler | Behavior |
-|------|-----------------|----------|
-| 1 | `NetworkCheckFilter` | No network → log/popup → **block** |
-| 2 | `GemCheckFilter` | Gem < 400 → log/popup → **block** |
-| 3 | `GoldCheckFilter` | Gold < 10,000 → log/popup → **block** |
-| 4 | `DeductCostFilter` | Deduct gem & gold (rollback on failure) |
-| 5 | `EnhanceHandler` | Upgrade 4★→5★, success log/popup, **return `true`** |
-
 ---
 
-## Example: Weapon Enhancement (Gold only)
+## Source-Generated FilterRegistry
 
-```
-SendAsync(WeaponEnhanceRequest)
-  → NetworkCheckFilter   (no network → block)
-    → GoldCheckFilter    (gold < 5,000 → block)
-      → DeductGoldFilter (deduct 5,000 gold)
-        → WeaponEnhanceHandler (upgrade weapon, return true)
-```
+The Source Generator reads `[Filter]` attributes at build time and emits a `FilterRegistry` class for each handler. No runtime reflection.
 
 ```csharp
-public struct WeaponEnhanceRequest : IRequest<WeaponEnhanceResult>
+// <auto-generated/>
+public static class EnhanceHandlerFilterRegistry
 {
-    public int WeaponId;
-    public int RequiredGold;
-
-    public WeaponEnhanceRequest(int weaponId, int requiredGold = 5000)
+    public static IFilter[] Filters => new IFilter[]
     {
-        WeaponId     = weaponId;
-        RequiredGold = requiredGold;
-    }
+        new NetworkCheckFilter(),
+        new GoldCheckFilter(),
+        new GemCheckFilter(),
+        new DeductGoldFilter(),
+        new DeductGemFilter(),
+    };
 }
-
-public struct WeaponEnhanceResult { public bool Success; }
-
-public class DeductGoldFilter : IFilter<WeaponEnhanceRequest>
-{
-    public async UniTask InvokeAsync(WeaponEnhanceRequest request, CancellationToken ct, Func<UniTask> next)
-    {
-        GameData.Inventory.Gold -= request.RequiredGold;
-        try   { await next(); }
-        catch { GameData.Inventory.Gold += request.RequiredGold; throw; }
-    }
-}
-
-[Filter(typeof(NetworkCheckFilter), Order = 0)]
-[Filter(typeof(GoldCheckFilter),    Order = 1)]
-[Filter(typeof(DeductGoldFilter),   Order = 2)]
-public class WeaponEnhanceHandler : IRequestHandler<WeaponEnhanceRequest, WeaponEnhanceResult>
-{
-    public async UniTask<WeaponEnhanceResult> HandleAsync(
-        WeaponEnhanceRequest request, CancellationToken ct = default)
-    {
-        await GameData.Weapons.EnhanceAsync(request.WeaponId, ct);
-        Debug.Log("Weapon enhanced successfully! ⚔️");
-        return new WeaponEnhanceResult { Success = true };
-    }
-}
-```
-
-```csharp
-// Setup & Call
-var mediator = new Mediator();
-mediator.Register<WeaponEnhanceRequest, WeaponEnhanceResult>(new WeaponEnhanceHandler());
-
-var result = await mediator.SendAsync<WeaponEnhanceRequest, WeaponEnhanceResult>(
-    new WeaponEnhanceRequest(weaponId: 2001));
-```
-
----
-
-## Example: Character Awakening (Gems only)
-
-```
-SendAsync(AwakenRequest)
-  → NetworkCheckFilter  (no network → block)
-    → GemCheckFilter    (gem < 800 → block)
-      → DeductGemFilter (deduct 800 gems)
-        → AwakenHandler (awaken character, return true)
-```
-
-```csharp
-public struct AwakenRequest : IRequest<AwakenResult>
-{
-    public int CharacterId;
-    public int RequiredGem;
-
-    public AwakenRequest(int characterId, int requiredGem = 800)
-    {
-        CharacterId = characterId;
-        RequiredGem = requiredGem;
-    }
-}
-
-public struct AwakenResult { public bool Success; }
-
-public class DeductGemFilter : IFilter<AwakenRequest>
-{
-    public async UniTask InvokeAsync(AwakenRequest request, CancellationToken ct, Func<UniTask> next)
-    {
-        GameData.Inventory.Gem -= request.RequiredGem;
-        try   { await next(); }
-        catch { GameData.Inventory.Gem += request.RequiredGem; throw; }
-    }
-}
-
-[Filter(typeof(NetworkCheckFilter), Order = 0)]
-[Filter(typeof(GemCheckFilter),     Order = 1)]
-[Filter(typeof(DeductGemFilter),    Order = 2)]
-public class AwakenHandler : IRequestHandler<AwakenRequest, AwakenResult>
-{
-    public async UniTask<AwakenResult> HandleAsync(
-        AwakenRequest request, CancellationToken ct = default)
-    {
-        await GameData.Characters.AwakenAsync(request.CharacterId, ct);
-        Debug.Log("Awakening complete! 💎 Character has awakened!");
-        return new AwakenResult { Success = true };
-    }
-}
-```
-
-```csharp
-// Setup & Call
-var mediator = new Mediator();
-mediator.Register<AwakenRequest, AwakenResult>(new AwakenHandler());
-
-var result = await mediator.SendAsync<AwakenRequest, AwakenResult>(
-    new AwakenRequest(characterId: 1001));
 ```
 
 ---
 
 ## API Reference
 
-### Core Interfaces
-
-#### `IRequest` / `IRequest<TResult>`
+### `IRequestPublisher.SendAsync`
 
 ```csharp
-public interface IRequest { }
-public interface IRequest<TResult> { }
+ValueTask<TResult?> SendAsync<TRequest, TResult>(
+    TRequest request,
+    CancellationToken ct = default)
+    where TRequest : IRequest<TResult>;
+
+ValueTask<TResult?> SendAsync<TRequest, TResult>(
+    TRequest request,
+    RequestContext context,
+    CancellationToken ct = default)
+    where TRequest : IRequest<TResult>;
 ```
 
-#### `IRequestHandler<TRequest>`
+Returns `null` when the pipeline is cancelled by a filter (i.e., `next` was never called through to the handler).
 
-`TRequest` **must be a `struct`** — required for IL2CPP AOT safety.
-
-```csharp
-public interface IRequestHandler<TRequest>
-    where TRequest : struct, IRequest
-{
-    UniTask HandleAsync(TRequest request, CancellationToken ct = default);
-}
-```
-
-#### `IRequestHandler<TRequest, TResult>`
+### `IRequestHandler<TRequest, TResult>`
 
 ```csharp
 public interface IRequestHandler<TRequest, TResult>
-    where TRequest : struct, IRequest<TResult>
+    where TRequest : IRequest<TResult>
 {
-    UniTask<TResult> HandleAsync(TRequest request, CancellationToken ct = default);
+    ValueTask<TResult> HandleAsync(TRequest request, CancellationToken ct = default);
 }
 ```
 
-#### `IFilter<TRequest>`
+### `Mediator` (builder)
 
-```csharp
-public interface IFilter<TRequest> where TRequest : struct, IRequest
-{
-    UniTask InvokeAsync(TRequest request, CancellationToken ct, Func<UniTask> next);
-}
-```
-
----
-
-### `[Filter]` Attribute
-
-Declaratively attach filters to a handler class. Lower `Order` runs first.
-
-```csharp
-[Filter(typeof(LoggingFilter))]
-[Filter(typeof(AuthFilter), Order = 1)]
-public class MyHandler : IRequestHandler<MyRequest> { ... }
-```
-
-> **IL2CPP note:** Filter types are read via reflection only once at startup, then cached. No open generics at runtime.
+| Method | Description |
+|--------|-------------|
+| `AddFilter(IFilter)` | Registers a global filter applied to every request |
+| `Register<TRequest, TResult>(handler, filters)` | Registers a handler with its filter array |
+| `BuildPublisher()` | Returns an `IRequestPublisher`; throws `ObjectDisposedException` if already disposed |
+| `Dispose()` | Cancels all in-flight requests; subsequent calls throw `ObjectDisposedException` |
 
 ---
 
-### Mediator
+## VContainer Integration
 
-```csharp
-var mediator = new Mediator();
-
-// Register handler (no return value)
-mediator.Register<AttackRequest>(new AttackHandler());
-
-// Register handler (with return value)
-mediator.Register<GetPlayerRequest, PlayerData>(new GetPlayerHandler());
-
-// Global filters — applied to every request, in registration order
-mediator.AddFilter(new LoggingFilter());
-mediator.AddFilter(new ExceptionHandlingFilter());
-
-// Send
-await mediator.SendAsync(new AttackRequest(target));
-var player = await mediator.SendAsync<GetPlayerRequest, PlayerData>(new GetPlayerRequest(id));
-
-// Disposable registration — unregister when done
-var sub = mediator.Register<AttackRequest>(new AttackHandler());
-sub.Dispose();
-```
-
----
-
-### Pipeline Execution Order
-
-```
-mediator.SendAsync(request)
-    → Global filters          (AddFilter registration order)
-        → Per-handler filters ([Filter] attribute, ascending Order)
-            → Handler.HandleAsync()
-        ← Per-handler filters post-process (reverse order)
-    ← Global filters post-process (reverse order)
-```
-
-Calling `next()` passes control to the next stage. **Not calling `next()` blocks the rest of the pipeline.**
-
----
-
-### UniTask Support
-
-UniTask is used automatically when `com.cysharp.unitask` is present in the project.
-Falls back to `ValueTask` otherwise.
-
-```csharp
-#if UNITASK_SUPPORT
-public UniTask HandleAsync(AttackRequest request, CancellationToken ct)
-    => UniTask.CompletedTask;
-#endif
-```
-
----
-
-## Installation
-
-Add via **Window → Package Manager → + → Add package from git URL**:
-
-```
-https://github.com/YoruYomix/UniMediator.git?path=com.yoruyomix.UniMediator
-```
-
----
-
-## Package Info
-
-| | |
-|---|---|
-| Minimum Unity Version | 2021.3 LTS |
-| IL2CPP | Supported (Source Generator, no open generics) |
-| Dependencies | None (VContainer and UniTask are optional) |
-| Distribution | UPM (Unity Package Manager) |
-
----
-
-## Optional: VContainer Extension
-
-If you're already using [VContainer](https://vcontainer.hadashikick.jp/) as your DI framework, a separate extension package is available.
-It automatically scans your assembly and binds all handlers and filters into the container — no manual `Register()` calls needed.
-
-Install via **Window → Package Manager → + → Add package from git URL**:
-
-```
-https://github.com/YoruYomix/UniMediator.git?path=com.yoruyomix.UniMediator.VContainer
-```
-
-### Setup
+Use the extension package to auto-scan and bind all handlers and filters — no manual `Register()` calls needed.
 
 ```csharp
 public class GameLifetimeScope : LifetimeScope
 {
     protected override void Configure(IContainerBuilder builder)
     {
-        // Register Mediator and optional global filters
         builder.UseMediator(mediator =>
         {
-            mediator.AddFilter(new LoggingFilter());
             mediator.AddFilter(new ExceptionHandlingFilter());
+            mediator.AddFilter(new LoggingFilter());
         });
 
-        // Auto-scan and bind all IRequestHandler<T> implementations in the assembly
+        // Scans and binds all IRequestHandler<T> in the assembly
         builder.RegisterMediatorHandlers(Assembly.GetExecutingAssembly());
     }
 }
 ```
 
-### Caller
+Inject `IRequestPublisher` wherever you need it — all handler and filter dependencies are resolved by the container automatically.
 
 ```csharp
-public class EnhanceButton : MonoBehaviour
+public class CharacterManager : MonoBehaviour
 {
-    private IMediator _mediator;
+    private IRequestPublisher _publisher;
 
     [Inject]
-    public void Construct(IMediator mediator) => _mediator = mediator;
-
-    public async void OnClickEnhance()
-    {
-        var result = await _mediator.SendAsync<EnhanceRequest, EnhanceResult>(
-            new EnhanceRequest(characterId: 1001));
-
-        Debug.Log(result.Success ? "Enhancement complete!" : "Enhancement cancelled.");
-    }
+    public void Construct(IRequestPublisher publisher) => _publisher = publisher;
 }
 ```
-
-With VContainer, all handler and filter dependencies are resolved automatically from the container — no manual wiring required.
 
 ---
 
 ## License
 
-MIT License
+MIT
